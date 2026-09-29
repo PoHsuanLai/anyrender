@@ -15,6 +15,8 @@
 //
 // **Filter Functions:**
 // - `Blur` - Gaussian blur effect
+// - `Brightness`, `Contrast`, `Grayscale`, `HueRotate`, `Invert`, `Opacity`, `Saturate`, `Sepia`,
+//   as colour matrices (see `FilterEffect::as_color_matrix`), and filter lists of them
 //
 // **Filter Primitives (Single Use Only):**
 // - `Flood` - Solid color fill
@@ -502,6 +504,22 @@ impl FilterEffect {
         Self::ColorMatrix(ColorMatrix::grayscale(amount))
     }
 
+    /// The effect as a 4x5 colour matrix (row-major, `[R, G, B, A, offset]` per output channel,
+    /// applied to non-premultiplied colour), if it is one.
+    ///
+    /// A `ColorMatrix` is its matrix. A `ComponentTransfer` is one when every channel's function is
+    /// affine: `Identity`, `Linear`, or a `Table` of two values (all the CSS `opacity()`,
+    /// `invert()`, `brightness()` and `contrast()` functions are), which lets a renderer that only
+    /// has a colour matrix pass draw them. Any other effect, and gamma or discrete transfers,
+    /// return `None`.
+    pub fn as_color_matrix(&self) -> Option<[f32; 20]> {
+        match self {
+            Self::ColorMatrix(matrix) => Some(matrix.0),
+            Self::ComponentTransfer(transfer) => transfer.as_color_matrix().map(|matrix| matrix.0),
+            _ => None,
+        }
+    }
+
     /// Calculate the bounds expansion as a `Rect` in user space.
     ///
     /// Returns a rectangle centered at the origin representing how much the filter
@@ -567,6 +585,129 @@ mod offset_expansion_tests {
             Rect::new(0.0, -3.0, 2.5, 0.0),
             "Offset expansion should be asymmetric and include the shift vector"
         );
+    }
+}
+
+#[cfg(test)]
+mod color_matrix_tests {
+    use super::FilterEffect;
+    use super::component_transfer::{GammaTransferFunction, TransferFunction};
+
+    const COLORS: [[f32; 4]; 3] = [
+        [0.8, 0.2, 0.1, 1.0],
+        [0.1, 0.5, 0.9, 0.6],
+        [0.0, 1.0, 0.5, 0.3],
+    ];
+
+    fn apply(matrix: [f32; 20], [r, g, b, a]: [f32; 4]) -> [f32; 4] {
+        let row = |i: usize| {
+            let m = &matrix[i * 5..i * 5 + 5];
+            (m[0] * r + m[1] * g + m[2] * b + m[3] * a + m[4]).clamp(0.0, 1.0)
+        };
+        [row(0), row(1), row(2), row(3)]
+    }
+
+    fn assert_close(got: [f32; 4], expected: [f32; 4], what: &str) {
+        for (g, e) in got.iter().zip(expected) {
+            assert!(
+                (g - e).abs() < 1e-4,
+                "{what}: got {got:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    /// Each function against its definition in the Filter Effects spec, written per channel.
+    #[test]
+    fn css_functions_match_their_spec_definitions() {
+        for amount in [0.0_f32, 0.3, 1.0, 1.6] {
+            let unit = amount.min(1.0);
+            for c @ [r, g, b, a] in COLORS {
+                let m = |effect: FilterEffect| effect.as_color_matrix().expect("a colour matrix");
+                let per = |f: &dyn Fn(f32) -> f32| [f(r), f(g), f(b), a].map(|v| v.clamp(0.0, 1.0));
+
+                assert_close(
+                    apply(m(FilterEffect::brightness(amount)), c),
+                    per(&|v| v * amount),
+                    "brightness",
+                );
+                assert_close(
+                    apply(m(FilterEffect::contrast(amount)), c),
+                    per(&|v| amount * v + (0.5 - 0.5 * amount)),
+                    "contrast",
+                );
+                assert_close(
+                    apply(m(FilterEffect::invert(unit)), c),
+                    per(&|v| unit * (1.0 - v) + (1.0 - unit) * v),
+                    "invert",
+                );
+                assert_close(
+                    apply(m(FilterEffect::opacity(unit)), c),
+                    [r, g, b, a * unit],
+                    "opacity",
+                );
+                let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                assert_close(
+                    apply(m(FilterEffect::grayscale(unit)), c),
+                    per(&|v| (1.0 - unit) * v + unit * luma),
+                    "grayscale",
+                );
+                let luma = 0.213 * r + 0.715 * g + 0.072 * b;
+                assert_close(
+                    apply(m(FilterEffect::saturate(amount)), c),
+                    per(&|v| luma + amount * (v - luma)),
+                    "saturate",
+                );
+                assert_close(
+                    apply(m(FilterEffect::hue_rotate(0.0)), c),
+                    [r, g, b, a],
+                    "hue-rotate(0)",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sepia_and_hue_rotate_match_the_spec_matrices() {
+        let [r, g, b, a] = COLORS[0];
+        let sepia = FilterEffect::sepia(1.0).as_color_matrix().unwrap();
+        assert_close(
+            apply(sepia, COLORS[0]),
+            [
+                0.393 * r + 0.769 * g + 0.189 * b,
+                0.349 * r + 0.686 * g + 0.168 * b,
+                0.272 * r + 0.534 * g + 0.131 * b,
+                a,
+            ]
+            .map(|v: f32| v.clamp(0.0, 1.0)),
+            "sepia(1)",
+        );
+        // A quarter turn: cos = 0, sin = 1.
+        let quarter = FilterEffect::hue_rotate(core::f32::consts::FRAC_PI_2)
+            .as_color_matrix()
+            .unwrap();
+        assert_close(
+            apply(quarter, COLORS[0]),
+            [
+                (0.213 - 0.213) * r + (0.715 - 0.715) * g + (0.072 + 0.928) * b,
+                (0.213 + 0.143) * r + (0.715 + 0.140) * g + (0.072 - 0.283) * b,
+                (0.213 - 0.787) * r + (0.715 + 0.715) * g + (0.072 + 0.072) * b,
+                a,
+            ]
+            .map(|v: f32| v.clamp(0.0, 1.0)),
+            "hue-rotate(90deg)",
+        );
+    }
+
+    #[test]
+    fn only_affine_transfers_are_matrices() {
+        let mut gamma = super::component_transfer::ComponentTransferFilter::brightness(1.0);
+        gamma.red_function = TransferFunction::Gamma(GammaTransferFunction {
+            amplitude: 1.0,
+            exponent: 2.0,
+            offset: 0.0,
+        });
+        assert!(gamma.as_color_matrix().is_none());
+        assert!(FilterEffect::Tile.as_color_matrix().is_none());
     }
 }
 
@@ -866,6 +1007,49 @@ pub mod component_transfer {
                 green_function: func.clone(),
                 blue_function: func.clone(),
                 alpha_function: TransferFunction::Identity,
+            }
+        }
+    }
+
+    impl ComponentTransferFilter {
+        /// The transfer as a colour matrix, if every channel's function is affine (see
+        /// [`TransferFunction::as_affine`]).
+        pub fn as_color_matrix(&self) -> Option<super::color_transformation::ColorMatrix> {
+            let [red, green, blue, alpha] = [
+                &self.red_function,
+                &self.green_function,
+                &self.blue_function,
+                &self.alpha_function,
+            ]
+            .map(TransferFunction::as_affine);
+            let mut matrix = [0.0; 20];
+            for (channel, affine) in [red?, green?, blue?, alpha?].into_iter().enumerate() {
+                matrix[channel * 5 + channel] = affine.slope;
+                matrix[channel * 5 + 4] = affine.intercept;
+            }
+            Some(super::color_transformation::ColorMatrix(matrix))
+        }
+    }
+
+    impl TransferFunction {
+        /// The function as `slope * c + intercept`, if it is affine: `Identity`, `Linear`, and a
+        /// `Table` of zero (the identity) or two values. Anything else returns `None`.
+        pub fn as_affine(&self) -> Option<LinearTransferFunction> {
+            match self {
+                Self::Identity => Some(LinearTransferFunction {
+                    slope: 1.0,
+                    intercept: 0.0,
+                }),
+                Self::Linear(linear) => Some(linear.clone()),
+                Self::Table(values) => match values.as_slice() {
+                    [] => Self::Identity.as_affine(),
+                    [from, to] => Some(LinearTransferFunction {
+                        slope: to - from,
+                        intercept: *from,
+                    }),
+                    _ => None,
+                },
+                Self::Discrete(_) | Self::Gamma(_) => None,
             }
         }
     }
