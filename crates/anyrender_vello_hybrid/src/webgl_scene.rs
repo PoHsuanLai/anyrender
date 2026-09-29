@@ -51,7 +51,9 @@ impl<'a> WebGlImageManager<'a> {
 }
 
 enum LayerKind {
-    Layer,
+    /// A layer with a clip path, made of this many vello layers (one per filter of a filter
+    /// list, at least one).
+    Layer(usize),
     Clip,
 }
 
@@ -112,13 +114,22 @@ impl PaintScene for WebGlScenePainter<'_> {
         filter: Option<Arc<Filter>>,
         _backdrop_filter: Option<Arc<Filter>>,
     ) {
-        let filter = filter.and_then(crate::filters::convert_filter);
+        let mut filters = filter
+            .map(|filter| crate::filters::convert_filters(&filter))
+            .unwrap_or_default()
+            .into_iter();
         self.scene.set_transform(transform);
-        self.layer_stack.push(LayerKind::Layer);
         self.scene
             .push_clip_path(&clip.into_path(DEFAULT_TOLERANCE));
+        // The blend, alpha and clip apply to the filtered result, so they go on the outermost
+        // layer; the rest of a filter list nests inside it.
         self.scene
-            .push_layer(None, Some(blend.into()), Some(alpha), None, filter);
+            .push_layer(None, Some(blend.into()), Some(alpha), None, filters.next());
+        let inner = filters.len();
+        for filter in filters {
+            self.scene.push_layer(None, None, None, None, Some(filter));
+        }
+        self.layer_stack.push(LayerKind::Layer(1 + inner));
     }
 
     fn push_clip_layer(&mut self, transform: Affine, clip: &impl Shape) {
@@ -131,8 +142,10 @@ impl PaintScene for WebGlScenePainter<'_> {
     fn pop_layer(&mut self) {
         if let Some(kind) = self.layer_stack.pop() {
             match kind {
-                LayerKind::Layer => {
-                    self.scene.pop_layer();
+                LayerKind::Layer(layers) => {
+                    for _ in 0..layers {
+                        self.scene.pop_layer();
+                    }
                     self.scene.pop_clip_path();
                 }
                 LayerKind::Clip => self.scene.pop_clip_path(),

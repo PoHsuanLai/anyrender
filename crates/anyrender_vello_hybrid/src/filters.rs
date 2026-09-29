@@ -1,20 +1,19 @@
-use std::sync::Arc;
-
 use anyrender::filters::{EdgeMode, Filter, FilterEffect};
 use vello_common::filter_effects::FilterPrimitive;
 
-pub(crate) fn convert_filter(filter: Arc<Filter>) -> Option<vello_common::filter_effects::Filter> {
-    let nodes = filter.nodes();
-    if nodes.is_empty() {
-        return None;
-    }
-
-    // Vello Hybrid only supports single-node filters at the moment
-    let node = &filter.nodes()[0];
-    let primitive = convert_filter_effect(&node.effect)?;
-    Some(vello_common::filter_effects::Filter::from_primitive(
-        primitive,
-    ))
+/// The vello filters to push, outermost first, for an anyrender filter.
+///
+/// Vello filters are single primitives, so a filter list (`contrast(1.2) blur(4px)`) becomes one
+/// filter layer per effect: the first effect in the list applies to the content first, so it is
+/// the innermost layer. Effects that vello cannot draw are skipped.
+pub(crate) fn convert_filters(filter: &Filter) -> Vec<vello_common::filter_effects::Filter> {
+    filter
+        .nodes()
+        .iter()
+        .filter_map(|node| convert_filter_effect(&node.effect))
+        .map(vello_common::filter_effects::Filter::from_primitive)
+        .rev()
+        .collect()
 }
 
 pub(crate) fn convert_filter_effect(effect: &FilterEffect) -> Option<FilterPrimitive> {
@@ -35,9 +34,13 @@ pub(crate) fn convert_filter_effect(effect: &FilterEffect) -> Option<FilterPrimi
             dx: offset.x as f32,
             dy: offset.y as f32,
         },
-        FilterEffect::ColorMatrix(_matrix) => return None, //FilterPrimitive::ColorMatrix { matrix: matrix.0 },
-        FilterEffect::Blend(_mode) => return None,         //FilterPrimitive::Blend { mode: *mode },
-        FilterEffect::ComponentTransfer(_component_transfer_filter) => return None,
+        FilterEffect::ColorMatrix(matrix) => FilterPrimitive::ColorMatrix { matrix: matrix.0 },
+        FilterEffect::Blend(_mode) => return None,
+        // The CSS opacity(), invert(), brightness() and contrast() functions are affine
+        // transfers, which are colour matrices.
+        FilterEffect::ComponentTransfer(_) => FilterPrimitive::ColorMatrix {
+            matrix: effect.as_color_matrix()?,
+        },
         FilterEffect::Composite(_composite_operator) => return None,
         FilterEffect::Morphology(_morphology_filter) => return None,
         FilterEffect::ConvolveMatrix(_convolution_kernel) => return None,
@@ -56,5 +59,46 @@ fn convert_edge_mode(edge_mode: EdgeMode) -> vello_common::filter_effects::EdgeM
         EdgeMode::Wrap => vello_common::filter_effects::EdgeMode::Wrap,
         EdgeMode::Mirror => vello_common::filter_effects::EdgeMode::Mirror,
         EdgeMode::None => vello_common::filter_effects::EdgeMode::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_css_colour_function_is_a_colour_matrix() {
+        for effect in [
+            FilterEffect::brightness(1.2),
+            FilterEffect::contrast(1.2),
+            FilterEffect::grayscale(0.5),
+            FilterEffect::hue_rotate(1.0),
+            FilterEffect::invert(0.5),
+            FilterEffect::opacity(0.5),
+            FilterEffect::saturate(2.0),
+            FilterEffect::sepia(0.5),
+        ] {
+            assert!(
+                matches!(
+                    convert_filter_effect(&effect),
+                    Some(FilterPrimitive::ColorMatrix { .. })
+                ),
+                "{effect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effects_vello_cannot_draw_are_dropped_from_a_list() {
+        let list = Filter::linear_list(
+            [
+                FilterEffect::contrast(1.2),
+                FilterEffect::Tile,
+                FilterEffect::blur(4.0),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(convert_filters(&list).len(), 2);
+        assert!(convert_filters(&Filter::empty()).is_empty());
     }
 }
