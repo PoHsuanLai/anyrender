@@ -14,6 +14,9 @@ pub struct VelloCpuScenePainter {
     pub(crate) render_ctx: vello_cpu::RenderContext,
     pub(crate) resources: vello_cpu::Resources,
     pub(crate) image_cache: ImageCache,
+    /// For each open anyrender layer, how many vello layers it took: one per filter of a filter
+    /// list, or one.
+    layer_stack: Vec<usize>,
 }
 
 impl VelloCpuScenePainter {
@@ -26,6 +29,7 @@ impl VelloCpuScenePainter {
             render_ctx: vello_cpu::RenderContext::new(width, height),
             resources: vello_cpu::Resources::new(),
             image_cache: ImageCache::new(config),
+            layer_stack: Vec::new(),
         }
     }
 
@@ -68,6 +72,7 @@ impl RenderContext for VelloCpuScenePainter {}
 impl PaintScene for VelloCpuScenePainter {
     fn reset(&mut self) {
         self.render_ctx.reset();
+        self.layer_stack.clear();
     }
 
     fn push_layer(
@@ -80,34 +85,46 @@ impl PaintScene for VelloCpuScenePainter {
         _backdrop_filter: Option<Arc<Filter>>,
     ) {
         #[cfg(feature = "filters")]
-        let filter = filter
-            .and_then(crate::filters::convert_filter)
-            .filter(|_| cfg!(not(feature = "multithreading")));
+        let mut filters = filter
+            .map(|filter| crate::filters::convert_filters(&filter))
+            .unwrap_or_default()
+            .into_iter();
 
         #[cfg(not(feature = "filters"))]
-        let filter = {
+        let mut filters = {
             let _ = filter;
-            None
+            core::iter::empty::<vello_common::filter_effects::Filter>()
         };
 
         self.render_ctx.set_transform(transform);
+        // The blend, alpha and clip apply to the filtered result, so they go on the outermost
+        // layer; the rest of a filter list nests inside it.
         self.render_ctx.push_layer(
             Some(&clip.into_path(DEFAULT_TOLERANCE)),
             Some(blend.into()),
             Some(alpha),
             None,
-            filter,
+            filters.next(),
         );
+        let inner = filters.len();
+        for filter in filters {
+            self.render_ctx
+                .push_layer(None, None, None, None, Some(filter));
+        }
+        self.layer_stack.push(1 + inner);
     }
 
     fn push_clip_layer(&mut self, transform: Affine, clip: &impl Shape) {
         self.render_ctx.set_transform(transform);
         self.render_ctx
             .push_clip_layer(&clip.into_path(DEFAULT_TOLERANCE));
+        self.layer_stack.push(1);
     }
 
     fn pop_layer(&mut self) {
-        self.render_ctx.pop_layer();
+        for _ in 0..self.layer_stack.pop().unwrap_or(1) {
+            self.render_ctx.pop_layer();
+        }
     }
 
     fn stroke<'a>(
