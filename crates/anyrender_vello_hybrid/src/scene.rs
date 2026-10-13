@@ -14,6 +14,7 @@ use wgpu::{CommandEncoder, Device, Queue, Texture, TextureView, TextureViewDescr
 use wgpu_context::DeviceHandle;
 
 use crate::image_fit::{ImageUploads, UploadedImage, downscale, fit_size};
+use rustc_hash::FxHashMap;
 
 const DEFAULT_TOLERANCE: f64 = 0.1;
 
