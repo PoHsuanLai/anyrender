@@ -7,7 +7,7 @@ use peniko::Color;
 use rustc_hash::FxHashMap;
 use std::future::Future;
 use std::sync::Arc;
-use vello_common::{TextureId, paint::ImageId};
+use vello_common::TextureId;
 use vello_hybrid::{
     RenderSettings, RenderSize, RenderTargetConfig, Renderer as VelloHybridRenderer, Resources,
     Scene as VelloHybridScene, TextureBindings,
@@ -18,7 +18,7 @@ use wgpu::{
 };
 use wgpu_context::{DeviceHandle, SurfaceRenderer, SurfaceRendererConfiguration, WGPUContext};
 
-use crate::{VelloHybridScenePainter, scene::ImageManager};
+use crate::{ImageUploads, VelloHybridScenePainter, scene::ImageManager};
 
 /// Drive the wgpu init future. On wasm32 we spawn it onto the JS microtask
 /// queue (blocking is not allowed). On native we drive it inline with
@@ -140,7 +140,7 @@ pub struct VelloHybridWindowRenderer {
     wgpu_context: WGPUContext,
     scene: VelloHybridScene,
     config: VelloHybridRendererOptions,
-    cached_images: FxHashMap<u64, ImageId>,
+    cached_images: ImageUploads,
 }
 impl VelloHybridWindowRenderer {
     #[allow(clippy::new_without_default)]
@@ -158,7 +158,7 @@ impl VelloHybridWindowRenderer {
             wgpu_context,
             window_handle: None,
             scene: VelloHybridScene::new_with(0, 0, render_settings),
-            cached_images: FxHashMap::default(),
+            cached_images: ImageUploads::default(),
         }
     }
 

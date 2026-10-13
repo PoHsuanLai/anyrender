@@ -6,9 +6,9 @@ use kurbo::{Affine, Diagonal2, Rect, Shape, Stroke};
 use peniko::{BlendMode, Color, Fill, FontData, StyleRef};
 use vello_common::paint::PaintType;
 
+use crate::image_fit::{ImageUploads, UploadedImage, downscale, fit_size};
 use peniko::ImageBrush;
-use rustc_hash::FxHashMap;
-use vello_common::paint::{ImageId, ImageSource};
+use vello_common::paint::ImageSource;
 
 use std::sync::Arc;
 
@@ -17,14 +17,14 @@ const DEFAULT_TOLERANCE: f64 = 0.1;
 pub struct WebGlImageManager<'a> {
     pub(crate) renderer: &'a mut vello_hybrid::WebGlRenderer,
     pub(crate) resources: &'a mut vello_hybrid::Resources,
-    pub(crate) cache: &'a mut FxHashMap<u64, ImageId>,
+    pub(crate) cache: &'a mut ImageUploads,
 }
 
 impl<'a> WebGlImageManager<'a> {
     pub fn new(
         renderer: &'a mut vello_hybrid::WebGlRenderer,
         resources: &'a mut vello_hybrid::Resources,
-        cache: &'a mut FxHashMap<u64, ImageId>,
+        cache: &'a mut ImageUploads,
     ) -> Self {
         Self {
             renderer,
@@ -33,20 +33,45 @@ impl<'a> WebGlImageManager<'a> {
         }
     }
 
-    pub(crate) fn upload_image(&mut self, image: &peniko::ImageData) -> ImageId {
+    /// Uploads an image to the atlas, downscaling it if it is larger than the atlas allows.
+    ///
+    /// Returns `None` if the image cannot be uploaded; it is then not drawn.
+    pub(crate) fn upload_image(&mut self, image: &peniko::ImageData) -> Option<UploadedImage> {
         let peniko_id = image.data.id();
 
-        if let Some(atlas_id) = self.cache.get(&peniko_id) {
-            return *atlas_id;
+        if let Some(uploaded) = self.cache.get(&peniko_id) {
+            return *uploaded;
         }
 
-        let ImageSource::Pixmap(pixmap) = ImageSource::from_peniko_image_data(image) else {
+        let uploaded = self.try_upload_image(image);
+        self.cache.insert(peniko_id, uploaded);
+        uploaded
+    }
+
+    fn try_upload_image(&mut self, image: &peniko::ImageData) -> Option<UploadedImage> {
+        // Pixmaps are limited to u16 sizes
+        if image.width > u32::from(u16::MAX) || image.height > u32::from(u16::MAX) {
+            return None;
+        }
+
+        let ImageSource::Pixmap(mut pixmap) = ImageSource::from_peniko_image_data(image) else {
             unreachable!();
         };
 
-        let atlas_id = self.renderer.upload_image(self.resources, &pixmap);
-        self.cache.insert(peniko_id, atlas_id);
-        atlas_id
+        // Downscale if it does not fit in the atlas
+        let size = (u32::from(pixmap.width()), u32::from(pixmap.height()));
+        let fit = fit_size(size, self.resources.max_image_size())?;
+        if fit != size {
+            let (width, height) = (u16::try_from(fit.0).ok()?, u16::try_from(fit.1).ok()?);
+            pixmap = Arc::new(downscale(&pixmap, width, height)?);
+        }
+        let scale = (
+            f64::from(fit.0) / f64::from(size.0),
+            f64::from(fit.1) / f64::from(size.1),
+        );
+
+        let id = self.renderer.upload_image(self.resources, &pixmap).ok()?;
+        Some(UploadedImage { id, scale })
     }
 }
 
@@ -74,28 +99,37 @@ impl<'s> WebGlScenePainter<'s> {
 }
 
 impl WebGlScenePainter<'_> {
-    fn convert_paint(&mut self, paint: PaintRef<'_>) -> PaintType {
-        match paint {
+    /// Converts a paint, and returns the correction to multiply onto the right of the paint
+    /// transform (identity unless an image was downscaled on upload).
+    ///
+    /// Returns `None` for an image that could not be uploaded: nothing should be drawn with it.
+    fn convert_paint(&mut self, paint: PaintRef<'_>) -> Option<(PaintType, Affine)> {
+        let paint = match paint {
             Paint::Solid(alpha_color) => PaintType::Solid(alpha_color),
             Paint::Gradient(gradient) => PaintType::Gradient(gradient.clone()),
-            Paint::Image(image_brush) => self.convert_image_paint(image_brush),
+            Paint::Image(image_brush) => return self.convert_image_paint(image_brush),
 
             // TODO: custom paint
             Paint::Resource(_) => PaintType::Solid(peniko::color::palette::css::TRANSPARENT),
             Paint::Custom(_) => PaintType::Solid(peniko::color::palette::css::TRANSPARENT),
-        }
+        };
+        Some((paint, Affine::IDENTITY))
     }
 
-    fn convert_image_paint(&mut self, image_brush: peniko::ImageBrushRef<'_>) -> PaintType {
-        let image_id = self.image_manager.upload_image(image_brush.image);
-        PaintType::Image(ImageBrush {
+    fn convert_image_paint(
+        &mut self,
+        image_brush: peniko::ImageBrushRef<'_>,
+    ) -> Option<(PaintType, Affine)> {
+        let uploaded = self.image_manager.upload_image(image_brush.image)?;
+        let image = PaintType::Image(ImageBrush {
             image: ImageSource::OpaqueId {
-                id: image_id,
+                id: uploaded.id,
                 // TODO: optimize opaque case
                 may_have_transparency: true,
             },
             sampler: image_brush.sampler,
-        })
+        });
+        Some((image, uploaded.paint_correction()))
     }
 }
 
@@ -163,10 +197,12 @@ impl PaintScene for WebGlScenePainter<'_> {
     ) {
         self.scene.set_transform(transform);
         self.scene.set_stroke(style.clone());
-        let paint = self.convert_paint(paint.into());
+        let Some((paint, correction)) = self.convert_paint(paint.into()) else {
+            return;
+        };
         self.scene.set_paint(paint);
         self.scene
-            .set_paint_transform(brush_transform.unwrap_or(Affine::IDENTITY));
+            .set_paint_transform(brush_transform.unwrap_or(Affine::IDENTITY) * correction);
         self.scene.stroke_path(&shape.into_path(DEFAULT_TOLERANCE));
     }
 
@@ -180,10 +216,12 @@ impl PaintScene for WebGlScenePainter<'_> {
     ) {
         self.scene.set_transform(transform);
         self.scene.set_fill_rule(style);
-        let paint = self.convert_paint(paint.into());
+        let Some((paint, correction)) = self.convert_paint(paint.into()) else {
+            return;
+        };
         self.scene.set_paint(paint);
         self.scene
-            .set_paint_transform(brush_transform.unwrap_or(Affine::IDENTITY));
+            .set_paint_transform(brush_transform.unwrap_or(Affine::IDENTITY) * correction);
         self.scene.fill_path(&shape.into_path(DEFAULT_TOLERANCE));
     }
 
@@ -201,8 +239,14 @@ impl PaintScene for WebGlScenePainter<'_> {
         glyph_transform: Option<Affine>,
         glyphs: impl Iterator<Item = Glyph> + Clone,
     ) {
-        let paint = self.convert_paint(paint.into());
+        let Some((paint, correction)) = self.convert_paint(paint.into()) else {
+            return;
+        };
         self.scene.set_paint(paint);
+        if correction != Affine::IDENTITY {
+            // Glyph runs do not take a brush transform; only a downscaled image needs one.
+            self.scene.set_paint_transform(correction);
+        }
         self.scene.set_transform(transform);
 
         let style: StyleRef<'a> = style.into();

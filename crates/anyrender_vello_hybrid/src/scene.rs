@@ -4,42 +4,49 @@ use anyrender::{Filter, NormalizedCoord, Paint, PaintRef, PaintScene, RenderCont
 use glifo::FontEmbolden;
 use kurbo::{Affine, Diagonal2, Rect, Shape, Stroke};
 use peniko::{BlendMode, Color, Fill, FontData, ImageBrush, ImageData, StyleRef};
-use rustc_hash::FxHashMap;
 use vello_common::{
     TextureId,
     geometry::RectU16,
-    paint::{ImageId, ImageSource, PaintType},
+    paint::{ImageSource, PaintType},
 };
 use vello_hybrid::{Renderer, Resources, SampleRect};
 use wgpu::{CommandEncoder, Device, Queue, Texture, TextureView, TextureViewDescriptor};
 use wgpu_context::DeviceHandle;
 
+use crate::image_fit::{ImageUploads, UploadedImage, downscale, fit_size};
+
 const DEFAULT_TOLERANCE: f64 = 0.1;
 
+/// Converts a paint, and returns the correction to multiply onto the right of the paint
+/// transform (identity unless an image was downscaled on upload).
+///
+/// Returns `None` for an image that could not be uploaded: nothing should be drawn with it.
 fn anyrender_paint_to_vello_hybrid_paint<'a>(
     paint: PaintRef<'a>,
     image_manager: &mut ImageManager<'_>,
-) -> PaintType {
-    match paint {
+) -> Option<(PaintType, Affine)> {
+    let paint = match paint {
         Paint::Solid(alpha_color) => PaintType::Solid(alpha_color),
         Paint::Gradient(gradient) => PaintType::Gradient(gradient.clone()),
 
         Paint::Image(image_brush) => {
-            let image_id = image_manager.upload_image(image_brush.image);
-            PaintType::Image(ImageBrush {
+            let uploaded = image_manager.upload_image(image_brush.image)?;
+            let image = PaintType::Image(ImageBrush {
                 image: ImageSource::OpaqueId {
-                    id: image_id,
+                    id: uploaded.id,
                     // TODO: optimize opaque case
                     may_have_transparency: true,
                 },
                 sampler: image_brush.sampler,
-            })
+            });
+            return Some((image, uploaded.paint_correction()));
         }
 
         // TODO: custom paint
         Paint::Resource(_) => PaintType::Solid(peniko::color::palette::css::TRANSPARENT),
         Paint::Custom(_) => PaintType::Solid(peniko::color::palette::css::TRANSPARENT),
-    }
+    };
+    Some((paint, Affine::IDENTITY))
 }
 
 pub struct ImageManager<'a> {
@@ -48,7 +55,7 @@ pub struct ImageManager<'a> {
     pub(crate) device: &'a Device,
     pub(crate) queue: &'a Queue,
     pub(crate) encoder: &'a mut CommandEncoder,
-    pub(crate) cache: &'a mut FxHashMap<u64, ImageId>,
+    pub(crate) cache: &'a mut ImageUploads,
 }
 
 impl<'a> ImageManager<'a> {
@@ -58,7 +65,7 @@ impl<'a> ImageManager<'a> {
         device: &'a Device,
         queue: &'a Queue,
         encoder: &'a mut CommandEncoder,
-        cache: &'a mut FxHashMap<u64, ImageId>,
+        cache: &'a mut ImageUploads,
     ) -> Self {
         Self {
             renderer,
@@ -70,33 +77,58 @@ impl<'a> ImageManager<'a> {
         }
     }
 
-    pub(crate) fn upload_image(&mut self, image: &ImageData) -> ImageId {
+    /// Uploads an image to the atlas, downscaling it if it is larger than the atlas allows.
+    ///
+    /// Returns `None` if the image cannot be uploaded; it is then not drawn.
+    pub(crate) fn upload_image(&mut self, image: &ImageData) -> Option<UploadedImage> {
         let peniko_id = image.data.id();
 
-        // Try to get ImageId from cache first
-        if let Some(atlas_id) = self.cache.get(&peniko_id) {
-            return *atlas_id;
+        // Try to get the upload from the cache first
+        if let Some(uploaded) = self.cache.get(&peniko_id) {
+            return *uploaded;
         };
 
+        let uploaded = self.try_upload_image(image);
+        self.cache.insert(peniko_id, uploaded);
+        uploaded
+    }
+
+    fn try_upload_image(&mut self, image: &ImageData) -> Option<UploadedImage> {
+        // Pixmaps are limited to u16 sizes
+        if image.width > u32::from(u16::MAX) || image.height > u32::from(u16::MAX) {
+            return None;
+        }
+
         // Convert ImageData to Pixmap
-        let ImageSource::Pixmap(pixmap) = ImageSource::from_peniko_image_data(image) else {
+        let ImageSource::Pixmap(mut pixmap) = ImageSource::from_peniko_image_data(image) else {
             unreachable!(); // ImageSource::from_peniko_image_data always return a Pixmap
         };
 
-        // Upload Pixamp
-        let atlas_id = self.renderer.upload_image(
-            self.resources,
-            self.device,
-            self.queue,
-            self.encoder,
-            &pixmap,
+        // Downscale if it does not fit in the atlas
+        let size = (u32::from(pixmap.width()), u32::from(pixmap.height()));
+        let fit = fit_size(size, self.resources.max_image_size())?;
+        if fit != size {
+            let (width, height) = (u16::try_from(fit.0).ok()?, u16::try_from(fit.1).ok()?);
+            pixmap = Arc::new(downscale(&pixmap, width, height)?);
+        }
+        let scale = (
+            f64::from(fit.0) / f64::from(size.0),
+            f64::from(fit.1) / f64::from(size.1),
         );
 
-        // Store ImageId in cache
-        self.cache.insert(peniko_id, atlas_id);
+        // Upload Pixmap
+        let id = self
+            .renderer
+            .upload_image(
+                self.resources,
+                self.device,
+                self.queue,
+                self.encoder,
+                &pixmap,
+            )
+            .ok()?;
 
-        // Return ImageId
-        atlas_id
+        Some(UploadedImage { id, scale })
     }
 }
 
@@ -232,10 +264,14 @@ impl PaintScene for VelloHybridScenePainter<'_> {
     ) {
         self.scene.set_transform(transform);
         self.scene.set_stroke(style.clone());
-        let paint = anyrender_paint_to_vello_hybrid_paint(paint.into(), &mut self.image_manager);
+        let Some((paint, correction)) =
+            anyrender_paint_to_vello_hybrid_paint(paint.into(), &mut self.image_manager)
+        else {
+            return;
+        };
         self.scene.set_paint(paint);
         self.scene
-            .set_paint_transform(brush_transform.unwrap_or(Affine::IDENTITY));
+            .set_paint_transform(brush_transform.unwrap_or(Affine::IDENTITY) * correction);
         self.scene.stroke_path(&shape.into_path(DEFAULT_TOLERANCE));
     }
 
@@ -277,10 +313,14 @@ impl PaintScene for VelloHybridScenePainter<'_> {
                 }
             }
             _ => {
-                let paint = anyrender_paint_to_vello_hybrid_paint(paint, &mut self.image_manager);
+                let Some((paint, correction)) =
+                    anyrender_paint_to_vello_hybrid_paint(paint, &mut self.image_manager)
+                else {
+                    return;
+                };
                 self.scene.set_paint(paint);
                 self.scene
-                    .set_paint_transform(brush_transform.unwrap_or(Affine::IDENTITY));
+                    .set_paint_transform(brush_transform.unwrap_or(Affine::IDENTITY) * correction);
                 self.scene.fill_path(&shape.into_path(DEFAULT_TOLERANCE));
             }
         }
@@ -300,8 +340,16 @@ impl PaintScene for VelloHybridScenePainter<'_> {
         glyph_transform: Option<Affine>,
         glyphs: impl Iterator<Item = anyrender::Glyph> + Clone,
     ) {
-        let paint = anyrender_paint_to_vello_hybrid_paint(paint.into(), &mut self.image_manager);
+        let Some((paint, correction)) =
+            anyrender_paint_to_vello_hybrid_paint(paint.into(), &mut self.image_manager)
+        else {
+            return;
+        };
         self.scene.set_paint(paint);
+        if correction != Affine::IDENTITY {
+            // Glyph runs do not take a brush transform; only a downscaled image needs one.
+            self.scene.set_paint_transform(correction);
+        }
         self.scene.set_transform(transform);
 
         let style: StyleRef<'a> = style.into();
