@@ -4,7 +4,8 @@
 //! Simple helpers for managing wgpu state and surfaces.
 
 use wgpu::{
-    Adapter, Device, Features, Instance, Limits, MemoryHints, Queue, Surface, SurfaceTarget,
+    Adapter, Backends, Device, Features, Instance, Limits, MemoryHints, Queue, Surface,
+    SurfaceTarget,
 };
 
 mod alpha_blitter;
@@ -18,6 +19,46 @@ pub use buffer_renderer::{BufferRenderer, BufferRendererConfig};
 pub use error::WgpuContextError;
 pub use surface_renderer::{SurfaceRenderer, SurfaceRendererConfiguration, TextureConfiguration};
 pub use util::block_on_wgpu;
+
+/// What a [`WGPUContext`] is created with. Build it with [`Default`] and the builder methods;
+/// [`WGPUContext::with_features_and_limits`] stays for callers that need only those two.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct WGPUContextOptions {
+    /// Features to request in addition to what the renderer needs.
+    pub extra_features: Option<Features>,
+    /// Limits to request in place of the defaults.
+    pub override_limits: Option<Limits>,
+    /// The backends the instance probes. `None` leaves wgpu's default (every backend the build
+    /// supports). Narrowing skips the backends that cannot work on the platform, which saves
+    /// their start-up cost. The `WGPU_BACKEND` environment variable wins over this when set, and
+    /// when the narrowed set yields no adapter a renderer may fall back once to the default set
+    /// (see [`WGPUContext::is_narrowed`]).
+    pub backends: Option<Backends>,
+}
+
+impl WGPUContextOptions {
+    pub fn extra_features(self, extra_features: Features) -> Self {
+        Self {
+            extra_features: Some(extra_features),
+            ..self
+        }
+    }
+
+    pub fn override_limits(self, override_limits: Limits) -> Self {
+        Self {
+            override_limits: Some(override_limits),
+            ..self
+        }
+    }
+
+    pub fn backends(self, backends: Backends) -> Self {
+        Self {
+            backends: Some(backends),
+            ..self
+        }
+    }
+}
 
 /// A wgpu `Device`, it's associated `Queue`, and the `Adapter` and `Instance` used to create them
 #[derive(Clone, Debug)]
@@ -103,6 +144,9 @@ pub struct WGPUContext {
     // Config
     extra_features: Option<Features>,
     override_limits: Option<Limits>,
+    /// True when `instance` was limited to caller-chosen backends, so a default one is a
+    /// possible fallback.
+    narrowed: bool,
 }
 
 impl Default for WGPUContext {
@@ -120,21 +164,60 @@ impl WGPUContext {
         extra_features: Option<Features>,
         override_limits: Option<Limits>,
     ) -> Self {
-        Self {
-            instance: Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::from_env().unwrap_or_default(),
-                flags: wgpu::InstanceFlags::from_build_config().with_env(),
-                backend_options: wgpu::BackendOptions::from_env_or_default(),
-                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-
-                // TODO: support passing display handle
-                // Needed for opengl/webgl
-                display: None,
-            }),
-            device_pool: Vec::new(),
+        Self::with_options(WGPUContextOptions {
             extra_features,
             override_limits,
+            backends: None,
+        })
+    }
+
+    /// Creates a context from `options`. `WGPU_BACKEND`, when set, overrides
+    /// `options.backends`.
+    pub fn with_options(options: WGPUContextOptions) -> Self {
+        let from_env = Backends::from_env();
+        let narrowed = from_env.is_none() && options.backends.is_some();
+        let backends = from_env.or(options.backends).unwrap_or_default();
+        Self {
+            instance: Self::new_instance(backends),
+            device_pool: Vec::new(),
+            extra_features: options.extra_features,
+            override_limits: options.override_limits,
+            narrowed,
         }
+    }
+
+    fn new_instance(backends: Backends) -> Instance {
+        Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            flags: wgpu::InstanceFlags::from_build_config().with_env(),
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+
+            // TODO: support passing display handle
+            // Needed for opengl/webgl
+            display: None,
+        })
+    }
+
+    /// An instance over the default backends (`WGPU_BACKEND` still applies). This is the
+    /// fallback when a narrowed instance finds no adapter: pass it to
+    /// [`replace_instance`](Self::replace_instance).
+    pub fn default_instance() -> Instance {
+        Self::new_instance(Backends::from_env().unwrap_or_default())
+    }
+
+    /// Whether the instance was limited to backends the caller chose, so that
+    /// [`default_instance`](Self::default_instance) could find adapters it cannot.
+    pub fn is_narrowed(&self) -> bool {
+        self.narrowed
+    }
+
+    /// Swaps in `instance` and drops the pooled devices, which belong to the old one. The
+    /// context is no longer narrowed afterwards.
+    pub fn replace_instance(&mut self, instance: Instance) {
+        self.instance = instance;
+        self.device_pool.clear();
+        self.narrowed = false;
     }
 
     pub fn extra_features(&self) -> Option<Features> {
@@ -160,6 +243,18 @@ impl WGPUContext {
         surface_config: SurfaceRendererConfiguration,
         intermediate_texture_config: Option<TextureConfiguration>,
     ) -> Result<SurfaceRenderer<'w>, WgpuContextError> {
+        // A window handle cannot be cloned here, so a narrowed instance is checked for any
+        // adapter before the surface is made, and replaced by the default one if it has none.
+        if self.narrowed {
+            let probe = self
+                .instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await;
+            if probe.is_err() {
+                self.replace_instance(Self::default_instance());
+            }
+        }
+
         // Create a surface from the window handle
         let surface = self.create_surface(window.into())?;
 

@@ -13,10 +13,12 @@ use vello_hybrid::{
     Scene as VelloHybridScene, TextureBindings,
 };
 use wgpu::{
-    CommandEncoderDescriptor, CompositeAlphaMode, Features, Limits, PresentMode, Texture,
+    Backends, CommandEncoderDescriptor, CompositeAlphaMode, Features, Limits, PresentMode, Texture,
     TextureFormat, TextureView, TextureViewDescriptor,
 };
-use wgpu_context::{DeviceHandle, SurfaceRenderer, SurfaceRendererConfiguration, WGPUContext};
+use wgpu_context::{
+    DeviceHandle, SurfaceRenderer, SurfaceRendererConfiguration, WGPUContext, WGPUContextOptions,
+};
 
 use crate::{ImageUploads, VelloHybridScenePainter, scene::ImageManager};
 
@@ -45,6 +47,9 @@ struct ActiveRenderState {
 /// `WGPUContext` are returned so the renderer can reclaim the context.
 struct InitOutput {
     active: ActiveRenderState,
+    /// Set when the narrowed backends found no adapter and the default ones were used: the
+    /// context must adopt this instance, which the new surface belongs to.
+    fallback_instance: Option<wgpu::Instance>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -61,6 +66,11 @@ enum RenderState {
 pub struct VelloHybridRendererOptions {
     pub features: Option<Features>,
     pub limits: Option<Limits>,
+    /// The wgpu backends to probe for an adapter. `None` leaves wgpu's default, every backend
+    /// the build supports; naming the one a platform draws with saves the others' start-up
+    /// cost. `WGPU_BACKEND` wins when set, and when the named backends yield no adapter the
+    /// renderer falls back once to the default set.
+    pub backends: Option<Backends>,
     pub render_settings: RenderSettings,
     pub base_color: Color,
     /// Alpha mode used when compositing the window surface.
@@ -72,6 +82,7 @@ impl Default for VelloHybridRendererOptions {
         Self {
             features: None,
             limits: None,
+            backends: None,
             render_settings: RenderSettings::default(),
             base_color: Color::WHITE,
             composite_alpha_mode: anyrender::CompositeAlphaMode::Auto,
@@ -95,6 +106,13 @@ impl VelloHybridRendererOptions {
     pub const fn limits(self, limits: Limits) -> Self {
         Self {
             limits: Some(limits),
+            ..self
+        }
+    }
+
+    pub const fn backends(self, backends: Backends) -> Self {
+        Self {
+            backends: Some(backends),
             ..self
         }
     }
@@ -173,7 +191,14 @@ impl VelloHybridWindowRenderer {
 fn build_wgpu_context(config: &VelloHybridRendererOptions) -> WGPUContext {
     let features =
         config.features.unwrap_or_default() | Features::CLEAR_TEXTURE | Features::PIPELINE_CACHE;
-    WGPUContext::with_features_and_limits(Some(features), config.limits.clone())
+    let mut options = WGPUContextOptions::default().extra_features(features);
+    if let Some(limits) = config.limits.clone() {
+        options = options.override_limits(limits);
+    }
+    if let Some(backends) = config.backends {
+        options = options.backends(backends);
+    }
+    WGPUContext::with_options(options)
 }
 
 // TODO: Make configurable?
@@ -272,6 +297,10 @@ impl WindowRenderer for VelloHybridWindowRenderer {
         let render_settings = self.config.render_settings;
         self.scene = VelloHybridScene::new_with(width as u16, height as u16, render_settings);
 
+        let fallback_window = self
+            .wgpu_context
+            .is_narrowed()
+            .then(|| window_handle.clone());
         let surface = self
             .wgpu_context
             .create_surface(window_handle)
@@ -300,16 +329,40 @@ impl WindowRenderer for VelloHybridWindowRenderer {
             .find_compatible_device_handle(Some(&surface));
 
         spawn_init(async move {
+            let mut surface = surface;
+            let mut fallback_instance = None;
             let device_handle = match existing_device_handle {
                 Some(device_handle) => device_handle,
-                None => DeviceHandle::new_from_compatible_surface(
-                    instance,
-                    Some(&surface),
-                    extra_features,
-                    override_limits,
-                )
-                .await
-                .expect("Error creating DeviceHandle"),
+                None => {
+                    let first = DeviceHandle::new_from_compatible_surface(
+                        instance,
+                        Some(&surface),
+                        extra_features,
+                        override_limits.clone(),
+                    )
+                    .await;
+                    match (first, fallback_window) {
+                        (Ok(device_handle), _) => device_handle,
+                        // The caller's backends found no adapter: try the default ones once.
+                        (Err(_), Some(window)) => {
+                            let instance = WGPUContext::default_instance();
+                            surface = instance
+                                .create_surface(window)
+                                .expect("Error creating surface");
+                            let device_handle = DeviceHandle::new_from_compatible_surface(
+                                instance.clone(),
+                                Some(&surface),
+                                extra_features,
+                                override_limits,
+                            )
+                            .await
+                            .expect("Error creating DeviceHandle");
+                            fallback_instance = Some(instance);
+                            device_handle
+                        }
+                        (Err(error), None) => panic!("Error creating DeviceHandle: {error}"),
+                    }
+                }
             };
 
             let adapter = &device_handle.adapter;
@@ -399,6 +452,7 @@ impl WindowRenderer for VelloHybridWindowRenderer {
                     render_surface,
                     texture_bindings: FxHashMap::default(),
                 },
+                fallback_instance,
             });
             on_ready();
         });
@@ -409,7 +463,13 @@ impl WindowRenderer for VelloHybridWindowRenderer {
             RenderState::Active { .. } => true,
             RenderState::Suspended => false,
             RenderState::Pending { receiver } => match receiver.try_recv() {
-                Ok(Some(InitOutput { active })) => {
+                Ok(Some(InitOutput {
+                    active,
+                    fallback_instance,
+                })) => {
+                    if let Some(instance) = fallback_instance {
+                        self.wgpu_context.replace_instance(instance);
+                    }
                     let device_handle = active.render_surface.device_handle.clone();
                     self.wgpu_context.device_pool.push(device_handle);
                     self.render_state = RenderState::Active(active);
