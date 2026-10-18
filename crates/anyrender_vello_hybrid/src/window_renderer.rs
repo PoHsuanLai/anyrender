@@ -502,9 +502,23 @@ impl WindowRenderer for VelloHybridWindowRenderer {
             return;
         };
 
+        // The scene keeps what was drawn into it until it is reset. A frame that is skipped
+        // (no surface texture while the window is occluded, or a failed present) must not be
+        // carried into the next one: on macOS a window starts occluded and is redrawn many times
+        // before it can present, and the first frame that does would hold all of them, past the
+        // device's buffer limits.
+        self.scene.reset();
+
         let render_surface = &mut state.render_surface;
 
         debug_timer!(timer, feature = "log_frame_times");
+
+        // Ask for the surface before drawing, so a frame that cannot be shown costs nothing.
+        let Ok(texture_view) = render_surface.target_texture_view() else {
+            // Skip frame in case of error getting surface texture
+            render_surface.clear_surface_texture();
+            return;
+        };
 
         let mut encoder =
             render_surface
@@ -546,12 +560,6 @@ impl WindowRenderer for VelloHybridWindowRenderer {
         // Regenerate the vello scene
         draw_fn(&mut scene_painter);
         timer.record_time("cmd");
-
-        let Ok(texture_view) = render_surface.target_texture_view() else {
-            // Skip frame in case of error getting surface texture
-            render_surface.clear_surface_texture();
-            return;
-        };
 
         // Construct Vello Hybrid TextureBindings
         let mut texture_bindings = TextureBindings::new();
